@@ -1,0 +1,503 @@
+---
+title: "Predicting obesity levels from eating and lifestyle habits"
+subtitle: "Machine learning workflow with Spark"
+author: "Inmaculada Ruiz-Morales"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r setup, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+**Importing the packages needed for the analysis:**
+```{r}
+library(sparklyr)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(broom)
+library(kableExtra)
+```
+
+
+# Introduction of the dataset,
+
+In this document, we are going to analyse a dataset hosted in the UCI Machine Learning Repository[1], donated by Fabio Mendoza Palechor and Alexis de la Hoz Manotas[2].https://archive.ics.uci.edu/dataset/544/estimation+of+obesity+levels+based+on+eating+habits+and+physical+condition.
+
+The csv file contains a  semisynthetic dataset with 2111 observations and 17 variables. All the variables are explained [here](https://thescipub.com/pdf/jcssp.2019.67.77.pdf).
+
+The dataset is fairly clean and tidy as it has already been pre-processed and balanced for the 7 possible values of the target class "NObeyesdad" with an oversampling technique. The raw data that originated the final dataset was obtained from the responses of an online survey designed to obtain information about eating habits, physical activity, and body measurements for the estimation of obesity.
+
+
+**Connecting to an Spark cluster and load of the data:**
+```{r}
+# Spark connection.
+sc = spark_connect(master = "local")
+
+# Upload of the data (you need to change the path)
+obesity <- spark_read_csv(sc, "yourpath/ObesityDataSet_raw_and_data_sinthetic.csv", 
+                          overwrite = TRUE)
+```
+
+
+# Exploratory Data Analysis
+
+For an easier to read analysis, columns are renamed with a more meaningful name:
+
+```{r}
+obesity_renamed <- obesity %>%
+  rename("family" = "family_history_with_overweight", "caloric_food" = "FAVC",
+         "vegetables" = "FCVC", "meals" = "NCP", "snacks"  = "CAEC",
+         "smoke" = "SMOKE", "water" = "CH2O", "count_cals" = "SCC",
+         "exercise" = "FAF", "technology" = "TUE", "alcohol" = "CALC",
+         "transport" = "MTRANS", "obesity_level" = "NObeyesdad",
+         "gender" = "Gender", "age" = "Age", "height" = "Height",
+         "weight" = "Weight")
+head(obesity_renamed) %>%
+  kable() %>%
+  kable_paper("striped", full_width = F, latex_options = "scale_down") %>%
+  row_spec(0, angle = -45)
+
+```
+
+
+**Missing values**
+
+Total number of missing values in each column were checked. None found. 
+
+```{r warning = FALSE}
+obesity_renamed %>%
+  summarise_all(~sum(as.integer(is.na(.)))) %>%
+  kable() %>%
+  kable_styling(latex_options = "scale_down")
+  
+```
+
+
+## Exploring numerical variables
+
+```{r warning = FALSE}
+obesity_renamed %>%
+  select(age, height, weight) %>%
+  sdf_describe() %>%
+  kable()
+```
+
+
+## Exploring categorical variables
+
+### Target variable
+
+The target variable is the variable we want to predict. It has seven possible values as the description of the dataset states. We can see that all of the categories are well balanced as a result of the SMOTE technique applied to the original data. 
+
+```{r}
+obesity_renamed %>%
+    count(obesity_level) %>%
+    kable()
+```
+
+### Predictor variables
+
+```{r}
+obesity_renamed %>%
+    count(gender) %>%
+    kable()
+
+obesity_renamed %>%
+    count(caloric_food) %>%
+    kable()
+
+obesity_renamed %>%
+    count(count_cals) %>%
+    kable()
+
+obesity_renamed %>%
+    count(family) %>%
+    kable()
+
+obesity_renamed %>%
+    count(snacks)%>%
+    kable()
+
+obesity_renamed %>%
+    count(smoke) %>%
+    kable()
+
+obesity_renamed %>%
+    count(transport) %>%
+    kable()
+
+```
+
+### Problematic variables
+
+**single count in a category**
+
+We found a single observation with the value "Always" in the alcohol question. We will merge this category with its closest "Frequently" when encoding the variable.
+
+```{r}
+obesity_renamed %>%
+    count(alcohol) %>%
+    kable()
+```
+
+ 
+**values that don´t correspond with their possible categories**
+
+These variables, when explored, showed values that don´t correspond with the possible values they should have according with their description. This may be due to an error during oversampling: **eg: maybe when the raw dataset was uploaded to the Weka explorer, those categorical variables were read as numeric, and the oversampling filter was applied to the dataset without changing first the variables from numerical to nominal**. I could use one of this solutions:
+1. Round all values to zero decimals. 
+2. One-Hot-encode values by range ( =>0 <1, =>1 <2, =>2 <3 ...etc ). 
+3. Discard the variables.
+As I don´t know how the Weka filter calculated those values and maybe the assumption regarding the origin of the values is wrong. I decide to go for the 3rd options as it seems the safest one in order to avoid adding bias. 
+
+```{r}
+obesity_renamed %>%
+    count(meals) %>%
+    head()
+
+obesity_renamed %>%
+    count(vegetables) %>%
+    head()
+
+obesity_renamed %>%
+    count(water) %>%
+    head()
+
+obesity_renamed %>%
+    count(technology) %>%
+    head()
+
+obesity_renamed %>%
+    count(exercise) %>%
+    head()
+   
+```
+
+# Some visualizations
+
+The fact that the dataset has been already balanced for the target class implies that it doesn´t represent the real population and therefore distributions per se won´t give us much information. Althought it is always insightful to see relationships between predictor variables and the variable we want to predict.
+**Eg, in the plot below we can see mean age is lower for insufficient and normal weight participants than for any of the other categories.**  
+
+```{r}
+
+obesity_renamed %>%
+    group_by(obesity_level) %>%
+    summarise(mean_age = mean(age)) %>%
+    collect() %>%
+    ggplot(aes(x = mean_age, y = obesity_level)) + geom_col(fill = "pink") + ylab('Obesity level') + xlab('Mean age in each group') +
+  ggtitle("Mean age of contestants for each obesity category")
+
+```
+
+
+Most of the times raw counts of cases can be useful, but in this particular dataset, as it is semisynthetic, the proportions are more interesting.
+
+```{r}
+data_plot <- obesity_renamed %>%
+    select(age, gender, caloric_food, count_cals, alcohol, family, snacks, smoke, 
+           transport, obesity_level) %>%
+    collect()
+
+ggplot(data_plot, aes(obesity_level, fill = family)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of people with family history of obesity
+          within each obesity category")
+
+ggplot(data_plot, aes(obesity_level, fill = gender)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of males and females within each obesity category")
+
+ggplot(data_plot, aes(obesity_level, fill = snacks)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of each snack habits within each obesity category")
+
+ggplot(data_plot, aes(obesity_level, fill = smoke)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of people within each obesity category that smokes")
+
+ggplot(data_plot, aes(obesity_level, fill = transport)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of people within each obesity category 
+          that uses one or another type of transport")
+
+ggplot(data_plot, aes(obesity_level, fill = alcohol)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of people within each obesity category 
+          that drinks alcohol")
+
+ggplot(data_plot, aes(obesity_level, fill = count_cals)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of people within each obesity category 
+          that counts calories")
+
+ggplot(data_plot, aes(obesity_level, fill = caloric_food)) +
+  geom_bar(position = "fill") + ylab("Proportion") + coord_flip() +
+  ggtitle("Proportion of pieple within each obesity category 
+          that eat high caloric foods")
+
+ggplot(data_plot, aes(family, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Family with obesity") +
+  ggtitle("Proportion of the different obesity levels 
+          within people with and without family history of obesity")
+
+ggplot(data_plot, aes(gender, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Gender") +
+  ggtitle("Proportion of the different obesity levels in each gender")
+
+ggplot(data_plot, aes(snacks, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Take snacks") +
+  ggtitle("Proportion of the different obesity levels within 
+          the different snacking habits")
+
+ggplot(data_plot, aes(smoke, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Smoking") +
+  ggtitle("Proportion of the different obesity levels 
+          within smokers and non-smokers")
+
+ggplot(data_plot, aes(transport, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Transport used") +
+  ggtitle("Proportion of the different obesity levels within groups of 
+          people with different transportation habits")
+
+ggplot(data_plot, aes(alcohol, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Drink alcohol") +
+  ggtitle("Proportion of the different obesity levels within groups of 
+          people with different drinking habits")
+
+ggplot(data_plot, aes(count_cals, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Count calories") +
+  ggtitle("Proportion of the different obesity levels within people 
+          who count calories and people who doesn´t")
+
+ggplot(data_plot, aes(caloric_food, fill = obesity_level)) +
+  geom_bar(position = "fill") + ylab("Proportion") + xlab("Eat high caloric foods") +
+  ggtitle("Proportion of the different obesity levels within people 
+          who eat high caloric foods and people who doesn´t")
+
+```
+
+
+
+# Data Preparation and cleaning
+
+
+Target class is relabelled from 0 to 6, categorical predictors encoded, two pairs of categories merged and the numeric variable age standardized.
+```{r}
+    # The levels for the target variable must be labelled so that they start from 0
+obesity_encoded <- obesity_renamed %>% 
+  mutate(target_obesity = case_when(
+    obesity_level == "Insufficient_Weight" ~ 0,
+    obesity_level == "Normal_Weight" ~ 1,
+    obesity_level == "Overweight_Level_I" ~ 2,
+    obesity_level == "Overweight_Level_II" ~ 3,
+    obesity_level == "Obesity_Type_I" ~ 4,
+    obesity_level == "Obesity_Type_II" ~ 5,
+    obesity_level == "Obesity_Type_III" ~ 6),
+    # In categorical variables I encode every category, but I will discard one of them for the modeling 
+    drink_zero = ifelse(alcohol == "no", 1, 0),
+    drink_moderate = ifelse(alcohol =="Sometimes", 1, 0),
+    drink_much = ifelse(alcohol == "Frecuently" | alcohol == "Always", 1, 0),
+    snack_zero = ifelse(snacks == "no", 1, 0),
+    snack_moderate = ifelse(snacks =="Sometimes", 1, 0),
+    snack_much = ifelse(snacks == "Frecuently" | alcohol == "Always", 1, 0),
+    bike = ifelse(transport == "Bike", 1, 0),
+    car = ifelse(transport == "Automobile", 1, 0),
+    walk = ifelse(transport == "Walking", 1, 0),
+    bus = ifelse(transport == "Public_Transportation", 1, 0),
+    motorbike = ifelse(transport == "Motorbike", 1, 0),
+    # For binary variables I encode only the "yes" answer
+    yes_caloric_food = ifelse(caloric_food == "yes", 1, 0),
+    yes_count_cals = ifelse(count_cals == "yes", 1, 0),
+    yes_family = ifelse(family == "yes", 1, 0),
+    yes_smoke = ifelse(smoke == "yes", 1, 0),
+    female = ifelse(gender == "Female", 1, 0),
+    #standardize numeric variable age with z-score
+    age_z = (age - mean(age, na.rm = TRUE)) / sd(age, na.rm = TRUE))
+
+```
+
+
+# Feature selection
+
+I select the columns I will use for the modeling
+
+```{r}
+data_for_modeling <- obesity_encoded %>%
+  select(target_obesity, drink_zero, drink_moderate, snack_zero, snack_moderate, bike, 
+         car, walk, bus, yes_caloric_food, yes_count_cals, yes_family, yes_smoke, 
+         female, age_z)
+
+head(data_for_modeling)
+```
+
+## Spliting the data into train and test sets
+
+I split the data into training and test sets. One for fitting the model and the second for evaluate how good the model is with unseen data.
+
+```{r}
+data_splits <- sdf_random_split(data_for_modeling, training = 0.9, testing = 0.1, seed = 8)
+obesity_train <- data_splits$training
+obesity_test <- data_splits$testing
+```
+
+
+
+# Modeling
+ 
+
+**TASK TO PERFORM** In terms of machine learning we have a **multiclass classification problem**. We could try to fit a few algorithms to our training data and see which one performs better. **Accuracy will be an appropriate metric** for this kind of task. 
+
+## Baseline accuracy
+
+As we have seven categories, the chances of having a correct prediction by guessing is 1/7 (aprox 14%). we can set our baseline accuracy in 14% and any model we can build that report an accuracy higher than that, would be better than random predictions.
+
+
+## Defining the formula
+
+Here, we define the formula we are going to use in the modeling.
+
+```{r}
+formula <- (target_obesity ~ female + yes_smoke + yes_family + yes_count_cals +
+              yes_caloric_food + drink_zero + drink_moderate + snack_zero + 
+              snack_moderate + bike + car + walk + bus + age_z)
+```
+
+
+## 1.- Multinomial Logistic Model
+
+```{r}
+# fitting a Multinomial Logistic model to the traing data
+multinomial_model = ml_logistic_regression(obesity_train, formula, family = "multinomial")
+```
+
+### Evaluation of the Multinomial Logistic model
+
+With the train data
+```{r}
+multinomial_accuracy_train <- ml_evaluate(multinomial_model, obesity_train)
+  multinomial_accuracy_train$accuracy()
+```
+
+With the test data: **58%** of prediction on new data are **correct**
+```{r}
+multinomial_accuracy_test <- ml_evaluate(multinomial_model, obesity_test)
+  multinomial_accuracy_test$accuracy()
+```
+
+
+## 2.- MLP model
+
+A few combination sets for the two hidden layers were manually tested (12, 12 gave the higher accuracy)
+
+```{r}
+# fitting a Multi Layer Peceptron model to the traing data
+mlp_model = ml_multilayer_perceptron_classifier(
+  obesity_train,
+  formula,
+  layers = c(14, 12, 12, 7))
+```
+
+### Evaluation of the MLP model
+
+With the train data
+
+```{r}
+ml_evaluate(mlp_model, obesity_train)
+```
+
+With the test data: **65%** of prediction on new data are **correct**
+
+```{r}
+ml_evaluate(mlp_model, obesity_test)
+```
+
+## 3.- Randon Forest  model
+### Evaluation of the Random Forest model
+
+
+
+```{r}
+rf_model <- obesity_train %>% 
+  ml_random_forest(formula, type = "classification") 
+```
+
+With the train data
+```{r}
+pred <- ml_predict(rf_model, obesity_train) 
+ 
+ml_multiclass_classification_evaluator(pred) 
+```
+
+With the test data: **58%** of prediction on new data are **correct**
+```{r}
+pred <- ml_predict(rf_model, obesity_test) 
+ 
+ml_multiclass_classification_evaluator(pred) 
+```
+
+
+# Summary
+
+>We have load a dataset to the Spark cluster.
+
+>We have explore, visualize and manipulate the data data within the Spark connection enviroment.
+
+>We have fit three different model to the cleaned and prepared data.
+
+>We have found the three models were able to predict the target variable better than the baseline accuracy we set. 
+
+>The Multileyer Perceptron model outperformed both, the Multinomial Logistic model and the Random Forest Model. 
+
+>The Multi Layer Perceptron algorithm, after manually tuning the hidden layers, reached a maximun accuracy percentage of *65%*
+
+
+
+
+
+# References
+
+Estimation of obesity levels based on eating habits and physical condition . (2019). UCI Machine Learning Repository. https://doi.org/10.24432/C5H31Z.
+
+[1] Dua, D. and Graff, C. (2019). UCI Machine Learning Repository [http://archive.ics.uci.edu/ml]. Irvine, CA: University of California, School of Information and Computer Science.
+
+[2] Palechor, F. M., & de la Hoz Manotas, A. (2019). Dataset for estimation of obesity levels based on eating habits and physical condition in individuals from Colombia, Peru and Mexico. Data in Brief, 104344.
+
+Mastering Spark with R Javier Luraschi, Kevin Kuo, Edgar Ruiz.
+
+
+
+# Software used
+
+
+**Spark:** Ratey, John J. 2013. Spark. New York, NY: Little, Brown & Company.
+
+**R:** R Core Team (2022). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria.
+URLcitatiohttps://www.R-project.org/.
+
+**Sparlyr:** Luraschi J, Kuo K, Ushey K, Allaire J, Falaki H, Wang L, Zhang A, Li Y, Ruiz E, The Apache Software Foundation (2022). _sparklyr: R Interface to Apache Spark_. R package version 1.7.8, https://CRAN.R-project.org/package=sparklyr.
+
+**Broom:** Robinson D, Hayes A, Couch S (2022). _broom: Convert Statistical Objects into Tidy Tibbles_. R package version 1.0.1, https://CRAN.R-project.org/package=broom.
+
+**Dplyr:** Wickham H, François R, Henry L, Müller K (2022). _dplyr: A Grammar of Data Manipulation_. R package version 1.0.10, https://CRAN.R-project.org/package=dplyr.
+
+**Knitr:** Yihui Xie (2022). knitr: A General-Purpose Package for Dynamic Report Generation in R. R package version 1.40.
+H. Wickham. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York, 2016
+
+**kableExtra:**  Zhu H (2021). _kableExtra: Construct Complex Table with 'kable' and Pipe Syntax_. R package version 1.3.4, https://CRAN.R-project.org/package=kableExtra.
+  
+**ggplot:**  H. Wickham. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York, 2016
+
+
+
+
+```{r}
+# Disconnecting from Spark.
+spark_disconnect(sc)
+
+```
+
+
+www.inmaruiz.com
+
